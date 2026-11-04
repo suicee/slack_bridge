@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "slack-bridge"
+version = "0.1.0"
+description = "Two-way Slack bridge so Claude can post progress and wait for replies during long-running work"
+requires-python = ">=3.9"
+dependencies = ["slack_sdk>=3.27"]
+
+[project.scripts]
+notify-slack = "slack_bridge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slack_bridge"]
