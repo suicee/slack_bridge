@@ -509,18 +509,32 @@ class Serve:
         owner_dm = {"label": "owner DM", "channel": b.dm_channel(), "thread": None}
         posted = 0
         if result is not None:
+            # Create tasks first so their "On it: … (tNNN)" line can be appended to the agent's own
+            # reply in the same thread: one message per hand-off, whatever the model does.
+            # Approval prompts are posted after the replies (they need to be their own message).
+            onit, deferred = {}, []
+            self._create_tasks(result.get("tasks") or [], by_id, onit=onit, deferred=deferred)
             for r in result.get("replies", []):
                 t = owner_dm if r.get("target") == "OWNER_DM" else by_id.get(r.get("target"))
                 if t is None:
                     _log(f"dropping reply to unknown target {r.get('target')!r}")
                     continue
+                text = r.get("text", "")
+                extra = onit.pop(r.get("target"), None) if t is not owner_dm else None
+                if extra:
+                    text = text.rstrip() + "\n\n" + "\n".join(extra)
                 try:
-                    self.post_reply(t, r.get("text", ""), r.get("files"))
+                    self.post_reply(t, text, r.get("files"))
                     posted += 1
                 except SlackApiError as e:
                     _log(f"failed to post to {r.get('target')}: {e.response.get('error')}")
+            for tid, lines in onit.items():  # hand-offs the agent didn't comment on
+                self._post(by_id[tid], "\n".join(lines))
+            for post_prompt in deferred:
+                post_prompt()
+            if result.get("tasks"):
+                self.tick(force=True)
             self.append_notes(result.get("notes", []))
-            self._create_tasks(result.get("tasks") or [], by_id)
             self._agent_cancels(result.get("cancel_tasks") or [], wakes)
         else:
             _log(f"central agent failed: {info.get('error')}")
@@ -614,7 +628,7 @@ class Serve:
             return f"Cancelled {tid}."
         return f"Unknown action {action!r}."
 
-    def _create_tasks(self, specs, by_id):
+    def _create_tasks(self, specs, by_id, onit=None, deferred=None):
         owner = self._owner()
         for spec in specs:
             target = by_id.get(spec.get("target"))
@@ -628,42 +642,51 @@ class Serve:
                                   origin, needs)
             _log(f"task {t['id']} created by {name} ({'needs approval' if needs else 'queued'})")
             if needs:
-                oname = self.bridge._name(owner)
-                by_reaction = "reactions:read" in self._scopes()
-                how = (f"{oname}: react :{self.opts['approve_reactions'][0]}: to approve or "
-                       f":{self.opts['reject_reactions'][0]}: to decline (counts after "
-                       f"~{self.opts['approval_settle']} s, so you can change your mind)." if by_reaction
-                       else "I'll start as soon as it's approved.")
-                prompts = []
-                r = self._post(origin, f"Got it: {t['title']} ({t['id']}). This needs {oname}'s OK first. {how}")
-                if r:
-                    prompts.append([origin["channel"], r["ts"]])
-                link = ""
-                if origin["thread"]:
-                    try:
-                        link = self.bridge.client.chat_getPermalink(
-                            channel=origin["channel"], message_ts=origin["thread"])["permalink"]
-                    except SlackApiError:
-                        pass
-                r = self._post({"channel": self.bridge.dm_channel(), "thread": None},
-                               f"🛠️ **Approval needed**: task **{t['id']}** from {name} in {origin['label']}"
-                               + (f" ([thread]({link}))" if link else "") + f"\n\n**{t['title']}**\n\n"
-                               f"```\n{t['instructions'][:2500]}\n```\n"
-                               + (f"React :{self.opts['approve_reactions'][0]}: / :{self.opts['reject_reactions'][0]}: "
-                                  "here or in the thread, or reply " if by_reaction else "Reply ")
-                               + f"`approve {t['id']}` or `reject {t['id']}` here "
-                               f"(or `notify-slack task approve {t['id']}` in the terminal).")
-                if r:
-                    prompts.append([self.bridge.dm_channel(), r["ts"]])
-                t["approval_msgs"] = prompts
-                self.tasks.save(t)
-                if by_reaction:  # pre-add both choices so the owner just clicks one
-                    for ch, ts in prompts:
-                        self.bridge.add_reaction(ch, ts, self.opts["approve_reactions"][0])
-                        self.bridge.add_reaction(ch, ts, self.opts["reject_reactions"][0])
+                def post_prompt(t=t, origin=origin, name=name):
+                    oname = self.bridge._name(owner)
+                    by_reaction = "reactions:read" in self._scopes()
+                    how = (f"{oname}: react :{self.opts['approve_reactions'][0]}: to approve or "
+                           f":{self.opts['reject_reactions'][0]}: to decline (counts after "
+                           f"~{self.opts['approval_settle']} s, so you can change your mind)." if by_reaction
+                           else "I'll start as soon as it's approved.")
+                    prompts = []
+                    r = self._post(origin, f"Got it: {t['title']} ({t['id']}). This needs {oname}'s OK first. {how}")
+                    if r:
+                        prompts.append([origin["channel"], r["ts"]])
+                    link = ""
+                    if origin["thread"]:
+                        try:
+                            link = self.bridge.client.chat_getPermalink(
+                                channel=origin["channel"], message_ts=origin["thread"])["permalink"]
+                        except SlackApiError:
+                            pass
+                    r = self._post({"channel": self.bridge.dm_channel(), "thread": None},
+                                   f"🛠️ **Approval needed**: task **{t['id']}** from {name} in {origin['label']}"
+                                   + (f" ([thread]({link}))" if link else "") + f"\n\n**{t['title']}**\n\n"
+                                   f"```\n{t['instructions'][:2500]}\n```\n"
+                                   + (f"React :{self.opts['approve_reactions'][0]}: / :{self.opts['reject_reactions'][0]}: "
+                                      "here or in the thread, or reply " if by_reaction else "Reply ")
+                                   + f"`approve {t['id']}` or `reject {t['id']}` here "
+                                   f"(or `notify-slack task approve {t['id']}` in the terminal).")
+                    if r:
+                        prompts.append([self.bridge.dm_channel(), r["ts"]])
+                    t["approval_msgs"] = prompts
+                    self.tasks.save(t)
+                    if by_reaction:  # pre-add both choices so the owner just clicks one
+                        for ch, ts in prompts:
+                            self.bridge.add_reaction(ch, ts, self.opts["approve_reactions"][0])
+                            self.bridge.add_reaction(ch, ts, self.opts["reject_reactions"][0])
+                if deferred is not None:
+                    deferred.append(post_prompt)
+                else:
+                    post_prompt()
             else:
-                self._post(origin, f"On it: {t['title']} ({t['id']}). I'll post the result here.")
-        if specs:
+                line = f"On it: {t['title']} ({t['id']}). I'll post the result here."
+                if onit is not None:
+                    onit.setdefault(spec.get("target"), []).append(line)
+                else:
+                    self._post(origin, line)
+        if specs and onit is None:
             self.tick(force=True)
 
     def _agent_cancels(self, ids, wakes):
