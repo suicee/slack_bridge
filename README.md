@@ -241,8 +241,15 @@ request in Slack ─► central agent: "tasks": [{target, title, instructions}]
 - **Robustness.** Workers are detached processes, so they survive a dispatcher restart, which
   picks them up again from `task.json`. Each attempt is capped by `worker_timeout` and
   `worker_max_budget_usd`. At most `max_workers` run at once; the rest wait in the queue.
+- **Model and thinking level per task.** Ask in Slack, e.g. "@bot … use sonnet, think hard". The
+  central agent sets the task's `model`/`effort`. The dispatcher checks them against
+  `worker_allowed_models` (fable, opus, sonnet, haiku) and `worker_allowed_efforts` (low, medium,
+  high, xhigh, max), and passes them to the worker as `--model` / `--effort`. The choice is shown in
+  the "On it" line, the approval prompt and `notify-slack task list`, and it is kept when a worker
+  resumes after Slurm jobs. Without a request, `worker_model` / `worker_effort` apply; if those are
+  unset, Claude Code's own defaults do.
 - **Settings** (under `"serve"`): `max_workers` (2), `worker_timeout` (14400 s),
-  `worker_max_budget_usd` (10), `worker_model`, `worker_permission_mode` (`"auto"`),
+  `worker_max_budget_usd` (10), `worker_model`, `worker_effort`, `worker_permission_mode` (`"auto"`),
   `job_check_interval` (120 s), `job_wait_max_hours` (72).
 
 **What `listen` reports.** It reports messages from `recipient` that are newer than the

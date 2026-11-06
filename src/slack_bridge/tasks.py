@@ -118,7 +118,8 @@ class Tasks:
                 out.append(t)
         return out
 
-    def create(self, title, instructions, requester, requester_name, origin, needs_approval):
+    def create(self, title, instructions, requester, requester_name, origin, needs_approval,
+               model=None, effort=None):
         ids = [int(os.path.basename(d)[1:]) for d in glob.glob(os.path.join(self.root_dir, "t[0-9]*"))
                if os.path.basename(d)[1:].isdigit()]
         n = max(ids, default=0) + 1
@@ -133,7 +134,8 @@ class Tasks:
              "requester": requester, "requester_name": requester_name, "origin": origin,
              "status": "pending_approval" if needs_approval else "queued",
              "created": _now(), "attempts": 0, "cost_usd": 0.0, "session_id": None,
-             "jobs": [], "history": [f"{_now()} created by {requester_name}"]}
+             "jobs": [], "model": model, "effort": effort,
+             "history": [f"{_now()} created by {requester_name}"]}
         self.save(t)
         return t
 
@@ -148,6 +150,8 @@ class Tasks:
             extra = ""
             if t["status"] == "waiting_on_jobs":
                 extra = f" (Slurm jobs {', '.join(t['jobs'])})"
+            run = " · ".join(x for x in (t.get("model"), t.get("effort") and f"{t['effort']} effort") if x)
+            extra += f" ({run})" if run else ""
             lines.append(f"{t['id']} [{t['status']}{extra}] \"{t['title']}\" — requested by "
                          f"{t['requester_name']} at {t['created']}; cost ${t['cost_usd']:.2f}")
         return lines

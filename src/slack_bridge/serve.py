@@ -62,7 +62,11 @@ DEFAULTS = {
     "max_workers": 2,                 # concurrent worker runs
     "worker_timeout": 4 * 3600,       # wall-clock seconds per worker attempt
     "worker_max_budget_usd": 10.0,    # spend cap per worker attempt
-    "worker_model": None,
+    "worker_model": None,             # default worker model; None = Claude Code's default
+    "worker_effort": None,            # default worker effort; None = Claude Code's default
+    # What a task may request (the central agent sets these only when the requester asks):
+    "worker_allowed_models": ["fable", "opus", "sonnet", "haiku"],
+    "worker_allowed_efforts": ["low", "medium", "high", "xhigh", "max"],
     "worker_permission_mode": "auto", # Claude Code auto mode: safety-checked autonomy
     "task_tick": 15,                  # seconds between task-registry checks
     "job_check_interval": 120,        # seconds between squeue checks for waiting tasks
@@ -111,6 +115,10 @@ REPLY_SCHEMA = {
                     "title": {"type": "string", "description": "Short title (<= 10 words)"},
                     "instructions": {"type": "string",
                                      "description": "Complete, self-contained instructions for the worker"},
+                    "model": {"type": "string",
+                              "description": "Only if the requester asked for a specific model, e.g. sonnet"},
+                    "effort": {"type": "string",
+                               "description": "Only if the requester asked for a thinking/effort level"},
                 },
                 "required": ["target", "title", "instructions"],
             },
@@ -168,6 +176,10 @@ LONG TASKS (worker agents)
   key numbers, attach the key figure(s), follow the Slack writing rules above (no paths). For status
   needs_input, relay the worker's question to the requester. For failed/timeout, say briefly what
   happened and what's left.
+- Worker model / thinking level: if the requester asks for one ("use sonnet", "think hard", "max effort"),
+  set "model" and/or "effort" on the task. Allowed models: {models}; efforts: {efforts}
+  ("think hard" ≈ high, "think harder" ≈ xhigh, "ultrathink"/"as hard as possible" ≈ max). Otherwise leave
+  them out — defaults apply ({default_model}, effort {default_effort}).
 - Put an id in "cancel_tasks" only when {owner} or that task's requester asks for it.
 - You CANNOT approve or reject tasks, and must never claim a task was approved, rejected, started or
   cancelled unless the task list shows it. Only the dispatcher applies approvals, when {owner} DMs a
@@ -329,6 +341,10 @@ class Serve:
         owner_id = self.bridge.recipient_id()
         text = SYSTEM_PROMPT.format(root=self.root, owner=self.bridge._name(owner_id), owner_id=owner_id,
                                     user=os.environ.get("USER", "your-user"),
+                                    models=", ".join(self.opts["worker_allowed_models"]),
+                                    efforts=", ".join(self.opts["worker_allowed_efforts"]),
+                                    default_model=self.opts["worker_model"] or "Claude Code's default model",
+                                    default_effort=self.opts["worker_effort"] or "default",
                                     channel=self.bridge._chan_label(self.cid))
         try:
             with open(self.path("instructions.md")) as f:
@@ -638,11 +654,13 @@ class Serve:
             requester, name = target["wakers"][-1]  # decided by the dispatcher, not the agent
             needs = requester != owner
             origin = {"channel": target["channel"], "thread": target["thread"], "label": target["label"]}
+            model, effort, note = self._model_choice(spec)
             t = self.tasks.create(spec.get("title") or "untitled", spec["instructions"], requester, name,
-                                  origin, needs)
+                                  origin, needs, model=model, effort=effort)
+            tag = self._run_tag(t) + note
             _log(f"task {t['id']} created by {name} ({'needs approval' if needs else 'queued'})")
             if needs:
-                def post_prompt(t=t, origin=origin, name=name):
+                def post_prompt(t=t, origin=origin, name=name, tag=tag):
                     oname = self.bridge._name(owner)
                     by_reaction = "reactions:read" in self._scopes()
                     how = (f"{oname}: react :{self.opts['approve_reactions'][0]}: to approve or "
@@ -650,7 +668,7 @@ class Serve:
                            f"~{self.opts['approval_settle']} s, so you can change your mind)." if by_reaction
                            else "I'll start as soon as it's approved.")
                     prompts = []
-                    r = self._post(origin, f"Got it: {t['title']} ({t['id']}). This needs {oname}'s OK first. {how}")
+                    r = self._post(origin, f"Got it: {t['title']} ({tag}). This needs {oname}'s OK first. {how}")
                     if r:
                         prompts.append([origin["channel"], r["ts"]])
                     link = ""
@@ -661,7 +679,7 @@ class Serve:
                         except SlackApiError:
                             pass
                     r = self._post({"channel": self.bridge.dm_channel(), "thread": None},
-                                   f"🛠️ **Approval needed**: task **{t['id']}** from {name} in {origin['label']}"
+                                   f"🛠️ **Approval needed**: task **{t['id']}** ({tag}) from {name} in {origin['label']}"
                                    + (f" ([thread]({link}))" if link else "") + f"\n\n**{t['title']}**\n\n"
                                    f"```\n{t['instructions'][:2500]}\n```\n"
                                    + (f"React :{self.opts['approve_reactions'][0]}: / :{self.opts['reject_reactions'][0]}: "
@@ -681,13 +699,35 @@ class Serve:
                 else:
                     post_prompt()
             else:
-                line = f"On it: {t['title']} ({t['id']}). I'll post the result here."
+                line = f"On it: {t['title']} ({tag}). I'll post the result here."
                 if onit is not None:
                     onit.setdefault(spec.get("target"), []).append(line)
                 else:
                     self._post(origin, line)
         if specs and onit is None:
             self.tick(force=True)
+
+    def _model_choice(self, spec):
+        """(model, effort, note) for a task spec, validated against the allowed lists."""
+        notes = []
+        model = (spec.get("model") or "").strip().lower() or None
+        effort = (spec.get("effort") or "").strip().lower() or None
+        if model and model not in self.opts["worker_allowed_models"]:
+            notes.append(f"model {model!r} isn't available, using the default")
+            model = None
+        if effort and effort not in self.opts["worker_allowed_efforts"]:
+            notes.append(f"effort {effort!r} isn't available, using the default")
+            effort = None
+        return model, effort, ("; " + "; ".join(notes) if notes else "")
+
+    def _run_tag(self, t):
+        """'t004 · sonnet · high effort' — model/effort only when explicitly chosen."""
+        parts = [t["id"]]
+        if t.get("model"):
+            parts.append(t["model"])
+        if t.get("effort"):
+            parts.append(f"{t['effort']} effort")
+        return " · ".join(parts)
 
     def _agent_cancels(self, ids, wakes):
         senders = {a["sender"] for a in wakes}
@@ -698,7 +738,7 @@ class Serve:
             else:
                 _log(f"ignoring cancel of {tid}: no matching requester in this batch")
 
-    def _worker_cmd(self):
+    def _worker_cmd(self, t=None):
         owner_id = self._owner()
         rel = os.path.relpath(self.tasks.root_dir, self.root)
         cmd = [self.claude, "-p", "--output-format", "json",
@@ -709,12 +749,16 @@ class Serve:
                "--max-budget-usd", str(self.opts["worker_max_budget_usd"])]
         for d in self._read_dirs():
             cmd += ["--add-dir", d]
-        if self.opts["worker_model"]:
-            cmd += ["--model", self.opts["worker_model"]]
+        model = (t or {}).get("model") or self.opts["worker_model"]
+        effort = (t or {}).get("effort") or self.opts["worker_effort"]
+        if model:
+            cmd += ["--model", model]
+        if effort:
+            cmd += ["--effort", effort]
         return cmd, owner_id, rel
 
     def _launch(self, t, prompt):
-        cmd, owner_id, rel = self._worker_cmd()
+        cmd, owner_id, rel = self._worker_cmd(t)
         sys_prompt = tasklib.WORKER_PROMPT.format(
             root=self.root, owner=self.bridge._name(owner_id), id=t["id"],
             task_dir_rel=os.path.join(rel, t["id"]), state_rel=os.path.relpath(self.state_dir, self.root))
